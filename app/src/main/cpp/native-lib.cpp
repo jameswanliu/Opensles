@@ -95,6 +95,7 @@ public:
     ~AudioContext() {
         free(file);
         free(buffer);
+        bufferSize = 0;
     }
 
 };
@@ -154,6 +155,7 @@ void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
             }
             (void) result;
         } else {
+            pthread_mutex_unlock(&audioEngineLock);
             LOGE("buffer IS NULL");
         }
 
@@ -396,9 +398,6 @@ extern "C"
 JNIEXPORT jboolean releaseFile(JNIEnv *env, jobject instance) {
     SLresult lresult;
     pthread_mutex_unlock(&audioEngineLock);
-    if (buffer != nullptr) {
-        free(buffer);
-    }
     lresult = (*slbpRecorderBufferQueue)->Clear(slbpRecorderBufferQueue);
     (void) lresult;
 
