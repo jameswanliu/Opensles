@@ -5,6 +5,7 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Log
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import com.hjq.permissions.OnPermission
@@ -16,15 +17,20 @@ import com.james.opensles.Constants.STATE_PAUSE
 import com.james.opensles.Constants.STATE_PLAYING
 import com.james.opensles.Constants.STATE_RECORD
 import kotlinx.android.synthetic.main.activity_main.*
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
+    private var sampleRate = 0
+    private var bufSize = 0
+    private val fileName = "opensles.pcm"
+    private lateinit var audioFilePath: String
     private var currentState = STATE_NORMAL
     private var isPlaying = false
     private var isRecord = false
     private var openslesHelper: OpenslesHelper? = null
 
-    companion object{
+    companion object {
         var created = false
     }
 
@@ -34,11 +40,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         requestPermission()
         openslesHelper = OpenslesHelper()
-        openslesHelper?.createEngine()
 
-
-        var sampleRate = 0
-        var bufSize = 0
         /*
          * retrieve fast audio path sample rate and buf size; if we have it, we pass to native
          * side to create a player with fast audio enabled [ fast audio == low latency audio ];
@@ -60,10 +62,6 @@ class MainActivity : AppCompatActivity() {
             bufSize = nativeParam.toInt()
         }
 
-        openslesHelper?.createBufferQueueAudioPlayer(sampleRate, bufSize)
-
-
-
         requestPermission()
 
         iv_action.onClick {
@@ -71,6 +69,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         iv_delete.onClick {
+            Log.i("release file ", "${openslesHelper?.releaseFile()}")
             changeNormalState()
         }
 
@@ -83,8 +82,6 @@ class MainActivity : AppCompatActivity() {
     private fun changeNormalState() {
         currentState = STATE_NORMAL
         chronometer.base = SystemClock.elapsedRealtime()
-//        MediaPlayerHelper.release()
-//        MediaRecorderHelper.stopAndRelease()
         rl_bottom.visibility = View.GONE
         iv_action.setImageResource(R.mipmap.btn_clue_audio)
     }
@@ -101,7 +98,10 @@ class MainActivity : AppCompatActivity() {
                 override fun hasPermission(
                     granted: List<String>,
                     isAll: Boolean
-                ) = Unit
+                ) {
+                    createFile()
+                    openslesHelper?.createBufferQueueAudioPlayer(audioFilePath, sampleRate, bufSize)
+                }
 
                 override fun noPermission(
                     denied: List<String>,
@@ -111,12 +111,24 @@ class MainActivity : AppCompatActivity() {
     }
 
 
+    private fun createFile() {
+        val file = File(externalCacheDir?.absolutePath, fileName)
+        if (file.exists()) {
+            file.delete()
+        }
+        file.createNewFile()
+        audioFilePath = file.absolutePath
+    }
+
+
     private fun recordAudio() {
+        createFile()
         if (!created) {
             created = openslesHelper?.createAudioRecorder()!!
         }
         if (created) {
-            openslesHelper?.startRecording()
+            openslesHelper?.startRecording(audioFilePath)
+            isRecord = true
         }
     }
 
@@ -135,34 +147,32 @@ class MainActivity : AppCompatActivity() {
                             Permission.WRITE_EXTERNAL_STORAGE, Permission.RECORD_AUDIO
                         )
                     )
-                ){
+                ) {
                     requestPermission()
                     return
                 }
-                    iv_action.setImageResource(R.mipmap.pause)
-                chronometer.base = SystemClock.elapsedRealtime()
-                chronometer.start()
-                isRecord = true
-                waveView.visibility = View.VISIBLE
                 recordAudio()
+
+                if (isRecord) {
+                    iv_action.setImageResource(R.mipmap.pause)
+                    chronometer.base = SystemClock.elapsedRealtime()
+                    chronometer.start()
+                    waveView.visibility = View.VISIBLE
+                }
             }
             STATE_COMPLETE -> {
                 iv_action.setImageResource(R.mipmap.icon_audio_state_uploaded)
                 chronometer.stop()
                 waveView.visibility = View.INVISIBLE
                 rl_bottom.visibility = View.VISIBLE
-//                MediaRecorderHelper.stopAndRelease()
+                val record = openslesHelper?.stopRecording()
+                Log.i("isrecording ==", "record= $record")
                 isRecord = false
             }
             STATE_PLAYING -> {
-//                MediaPlayerHelper.resume()
-                openslesHelper?.selectClip(4,2)
+                openslesHelper?.selectClip(4, 2)
                 isPlaying = true
                 iv_action.setImageResource(R.mipmap.icon_audio_state_uploaded_play)
-//                MediaPlayerHelper.playsound(MediaRecorderHelper.playpath, MediaPlayer.OnCompletionListener {
-//                    currentState = STATE_COMPLETE
-//                    changeState()
-//                })
             }
             STATE_PAUSE -> {
 //                MediaPlayerHelper.pause()
@@ -171,10 +181,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-
-
-
-
 
 
     private fun changeState() {

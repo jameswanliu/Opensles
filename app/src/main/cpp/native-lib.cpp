@@ -37,8 +37,8 @@
 #define TAG "OPENSLES"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,TAG,__VA_ARGS__)
+#define CHANEL 2
 static const char *classpath = "com/james/opensles/OpenslesHelper";
-
 
 JavaVM *global_vm;
 JNIEnv *global_env;
@@ -55,26 +55,12 @@ SLObjectItf bpPlayerObject;
 SLVolumeItf slVolumeItf;
 SLEffectSendItf slEffectSendItf;
 SLPlayItf pPlayer;
-static SLmilliHertz bqPlayerSampleRate = 0;
-static jint bqPlayerBufSize = 0;
+static int bqPlayerSampleRate = 44100;
+static size_t bqPlayerBufSize = static_cast<size_t >( CHANEL * bqPlayerSampleRate * 2);
 
-
-// synthesized sawtooth clip
-#define SAWTOOTH_FRAMES 8000
-static short sawtoothBuffer[SAWTOOTH_FRAMES];
+unsigned char *buffer; //缓冲区
 
 pthread_mutex_t audioEngineLock = PTHREAD_MUTEX_INITIALIZER;
-
-// 5 seconds of recorded audio at 16 kHz mono, 16-bit signed little endian
-#define RECORDER_FRAMES (16000 * 5)
-static short recorderBuffer[RECORDER_FRAMES];
-static unsigned recorderSize = 0;
-static short *resampleBuf = NULL;
-
-// pointer and size of the next player buffer to enqueue, and number of remaining buffers
-static short *nextBuffer;
-static unsigned nextSize;
-static int nextCount;
 
 /**
  *
@@ -88,17 +74,49 @@ static int nextCount;
  *
  */
 
-extern "C"
-JNIEXPORT void createEngine(JNIEnv *env, jobject instance) {
+
+class AudioContext {
+
+public:
+    AudioContext(FILE *file,
+                 unsigned char *buffer,
+                 size_t bufferSize) {
+        this->file = file;
+        this->buffer = buffer;
+        this->bufferSize = bufferSize;
+    }
+
+public:
+    FILE *file;
+    unsigned char *buffer;
+    size_t bufferSize;
+
+
+    ~AudioContext() {
+        free(file);
+        free(buffer);
+    }
+
+};
+
+AudioContext *audioContext;
+
+void createEngine() {
     SLresult lresult;
-    lresult = slCreateEngine(&slengineObject, 0, NULL, 0, NULL, NULL);
+
+    SLEngineOption options[] = {{(SLuint32) SL_ENGINEOPTION_THREADSAFE, (SLuint32) SL_BOOLEAN_TRUE}};
+    lresult = slCreateEngine(&slengineObject, 1, options, 0, NULL, NULL);
     (void) lresult;
     lresult = (*slengineObject)->Realize(slengineObject, SL_BOOLEAN_FALSE);
     (void) lresult;
     lresult = (*slengineObject)->GetInterface(slengineObject, SL_IID_ENGINE, &slEngineItf);
     (void) lresult;
 
+}
 
+void CreateOutputMix() {
+
+    SLresult lresult;
     SLInterfaceID slInterfaceId[1] = {SL_IID_ENVIRONMENTALREVERB};
     SLboolean slb[1] = {SL_BOOLEAN_FALSE};
     lresult = (*slEngineItf)->CreateOutputMix(slEngineItf, &outputMixItf, 1, slInterfaceId, slb);
@@ -109,10 +127,6 @@ JNIEXPORT void createEngine(JNIEnv *env, jobject instance) {
 
     lresult = (*outputMixItf)->GetInterface(outputMixItf, SL_IID_ENVIRONMENTALREVERB,
                                             &slEnvironmentalReverbItf);
-
-    //(*slEnvironmentalReverbItf)->GetDensity
-//    (*slEnvironmentalReverbItf)->GetDecayTime
-
     (void) lresult;
 
     if (SL_RESULT_SUCCESS == lresult) {
@@ -122,106 +136,40 @@ JNIEXPORT void createEngine(JNIEnv *env, jobject instance) {
     }
 }
 
-/*
- * Only support up-sampling
- */
-short *createResampledBuf(uint32_t idx, uint32_t srcRate, unsigned *size) {
-    short *src = NULL;
-    short *workBuf;
-    int upSampleRate;
-    int32_t srcSampleCount = 0;
-
-    if (0 == bqPlayerSampleRate) {
-        return NULL;
-    }
-    if (bqPlayerSampleRate % srcRate) {
-        /*
-         * simple up-sampling, must be divisible
-         */
-        return NULL;
-    }
-    upSampleRate = bqPlayerSampleRate / srcRate;
-
-    switch (idx) {
-        case 0:
-            return NULL;
-//        case 1: // HELLO_CLIP
-//            srcSampleCount = sizeof(hello) >> 1;
-//            src = (short*)hello;
-//            break;
-//        case 2: // ANDROID_CLIP
-//            srcSampleCount = sizeof(android) >> 1;
-//            src = (short*) android;
-//            break;
-        case 3: // SAWTOOTH_CLIP
-            srcSampleCount = SAWTOOTH_FRAMES;
-            src = sawtoothBuffer;
-            break;
-        case 4: // captured frames
-            srcSampleCount = recorderSize / sizeof(short);
-            src = recorderBuffer;
-            break;
-        default:
-            assert(0);
-            return NULL;
-    }
-
-    resampleBuf = (short *) malloc((srcSampleCount * upSampleRate) << 1);
-    if (resampleBuf == NULL) {
-        return resampleBuf;
-    }
-    workBuf = resampleBuf;
-    for (int sample = 0; sample < srcSampleCount; sample++) {
-        for (int dup = 0; dup < upSampleRate; dup++) {
-            *workBuf++ = src[sample];
-        }
-    }
-
-    *size = (srcSampleCount * upSampleRate) << 1;     // sample format is 16 bit
-    return resampleBuf;
-}
-
-
-void releaseResampleBuf(void) {
-    if (0 == bqPlayerSampleRate) {
-        /*
-         * we are not using fast path, so we were not creating buffers, nothing to do
-         */
-        return;
-    }
-
-    free(resampleBuf);
-    resampleBuf = NULL;
-}
-
 
 void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
-    assert(NULL == context);
     // for streaming playback, replace this test by logic to find and fill the next buffer
-    if (--nextCount > 0 && NULL != nextBuffer && 0 != nextSize) {
-        SLresult result;
-        // enqueue another buffer
-        result = (*slbpPlayerBufferQueue)->Enqueue(slbpPlayerBufferQueue, nextBuffer, nextSize);
-        // the most likely other result is SL_RESULT_BUFFER_INSUFFICIENT,
-        // which for this code example would indicate a programming error
-        if (SL_RESULT_SUCCESS != result) {
-            pthread_mutex_unlock(&audioEngineLock);
+    AudioContext *audioContext = reinterpret_cast<AudioContext *>(context);
+
+    if (audioContext != nullptr) {
+        if (audioContext->buffer != nullptr && audioContext->bufferSize > 0) {
+            SLresult result;
+            // enqueue another buffer
+            result = (*slbpPlayerBufferQueue)->Enqueue(slbpPlayerBufferQueue, audioContext->buffer,
+                                                       audioContext->bufferSize);
+            // the most likely other result is SL_RESULT_BUFFER_INSUFFICIENT,
+            // which for this code example would indicate a programming error
+            if (SL_RESULT_SUCCESS != result) {
+                pthread_mutex_unlock(&audioEngineLock);
+            }
+            (void) result;
+        } else {
+            LOGE("buffer IS NULL");
         }
-        (void) result;
+
     } else {
-        releaseResampleBuf();
         pthread_mutex_unlock(&audioEngineLock);
+        LOGE("AUDIOCONTEXT IS NULL");
     }
 }
 
 extern "C"
 JNIEXPORT void
-createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jint sampleRate, jint samplesPerBuf) {
+createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jstring path, jint sampleRate,
+                             jint samplesPerBuf) {
     SLresult lresult;
-    if (sampleRate >= 0 && samplesPerBuf >= 0) {
-        bqPlayerSampleRate = sampleRate * 1000;
-        bqPlayerBufSize = samplesPerBuf;
-    }
+    const char *filePath = env->GetStringUTFChars(path, JNI_FALSE);
+    FILE *file = fopen(filePath, "r");
 
     //配置buffer queue
     SLDataLocator_AndroidSimpleBufferQueue inputlocator = {SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
@@ -241,10 +189,6 @@ createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jint sampleRate, jin
     SLDataFormat_PCM dataFormat = {SL_DATAFORMAT_PCM, 1, SL_SAMPLINGRATE_8,
                                    SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16,
                                    SL_SPEAKER_FRONT_CENTER, SL_BYTEORDER_LITTLEENDIAN};
-
-    if (bqPlayerSampleRate) {
-        dataFormat.samplesPerSec = bqPlayerSampleRate;
-    }
 
     /**
      * 定义音频来源
@@ -281,12 +225,24 @@ createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jint sampleRate, jin
                                               &slEffectSendItf);
     (void) lresult;
 
+
+    lresult = (*bpPlayerObject)->GetInterface(bpPlayerObject, SL_IID_BUFFERQUEUE,
+                                              &slbpPlayerBufferQueue);
+    (void) lresult;
+
+
+    buffer = (unsigned char *) malloc(bqPlayerBufSize);
+
+    audioContext = new AudioContext(file, buffer, bqPlayerBufSize);
+
     lresult = (*slbpPlayerBufferQueue)->RegisterCallback(slbpPlayerBufferQueue,
                                                          bqPlayerCallback,
-                                                         nullptr);
+                                                         audioContext);
     (void) lresult;
     lresult = (*pPlayer)->SetPlayState(pPlayer, SL_PLAYSTATE_PLAYING);
     (void) lresult;
+
+    env->ReleaseStringUTFChars(path, filePath);
 }
 
 
@@ -300,18 +256,15 @@ JNIEXPORT jboolean enableReverb(JNIEnv *env, jobject instance, jboolean boolean)
 
 
 void bqRecorderCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
-    assert(NULL == context);
     SLresult result;
     result = (*slRecordItf)->SetRecordState(slRecordItf, SL_RECORDSTATE_STOPPED);
-    if (SL_RESULT_SUCCESS == result) {
-        recorderSize = RECORDER_FRAMES * sizeof(short);
-    }
+    (void) result;
     pthread_mutex_unlock(&audioEngineLock);
 }
 
 
 extern "C"
-JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance, jboolean boolean) {
+JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance) {
     SLresult lresult;
 
 
@@ -325,13 +278,13 @@ JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance, jboolean b
                                    SL_SPEAKER_FRONT_CENTER, SL_BYTEORDER_LITTLEENDIAN};
     SLDataSink audioSnk = {&loc_bq, &format_pcm};
 
-    SLInterfaceID ids = {SL_IID_BUFFERQUEUE};
-    SLboolean bools = {SL_BOOLEAN_TRUE};
+    const SLInterfaceID ids[1] = {SL_IID_ANDROIDSIMPLEBUFFERQUEUE};
+    const SLboolean bools[1] = {SL_BOOLEAN_TRUE};
 
     lresult = (*slEngineItf)->CreateAudioRecorder(slEngineItf, &slRecorderObject, &audioSrc,
-                                                  &audioSnk, 1, &ids, &bools);
+                                                  &audioSnk, 1, ids, bools);
     (void) lresult;
-    if (SL_BOOLEAN_FALSE == lresult) {
+    if (SL_RESULT_SUCCESS != lresult) {
         LOGE("CREATE RECORDER ERROR");
         return JNI_FALSE;
     }
@@ -340,7 +293,7 @@ JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance, jboolean b
     (void) lresult;
     lresult = (*slRecorderObject)->GetInterface(slRecorderObject, SL_IID_RECORD, &slRecordItf);
     (void) lresult;
-    lresult = (*slRecorderObject)->GetInterface(slRecorderObject, SL_IID_BUFFERQUEUE,
+    lresult = (*slRecorderObject)->GetInterface(slRecorderObject, SL_IID_ANDROIDSIMPLEBUFFERQUEUE,
                                                 &slbpRecorderBufferQueue);
     (void) lresult;
 
@@ -351,8 +304,11 @@ JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance, jboolean b
 }
 
 
+
+
+
 extern "C"
-JNIEXPORT void startRecording(JNIEnv *env, jobject instance) {
+JNIEXPORT void startRecording(JNIEnv *env, jobject instance, jstring path) {
     SLresult lresult;
     if (pthread_mutex_trylock(&audioEngineLock)) {
         return;
@@ -361,16 +317,37 @@ JNIEXPORT void startRecording(JNIEnv *env, jobject instance) {
     lresult = (*slRecordItf)->SetRecordState(slRecordItf, SL_RECORDSTATE_STOPPED);
     (void) lresult;
 
+    lresult = (*slbpRecorderBufferQueue)->Clear(slbpRecorderBufferQueue);
+    (void) lresult;
 
-    recorderSize = 0;
+    const char *filePath = env->GetStringUTFChars(path, JNI_FALSE);
+    FILE *file = fopen(filePath, "w");
+    if (file == NULL) {
+        LOGE("OPEN FILE ERROR");
+        return;
+    }
 
-    lresult = (*slbpRecorderBufferQueue)->Enqueue(slbpRecorderBufferQueue, recorderBuffer,
-                                                  RECORDER_FRAMES *
-                                                  sizeof(short));
+    if (buffer != nullptr) {
+        free(buffer);
+    }
+    buffer = (unsigned char *) malloc(bqPlayerBufSize);
+    audioContext = new AudioContext(file, buffer, bqPlayerBufSize);
+    lresult = (*slbpRecorderBufferQueue)->Enqueue(slbpRecorderBufferQueue, audioContext->buffer,
+                                                  audioContext->bufferSize);
     (void) lresult;
     lresult = (*slRecordItf)->SetRecordState(slRecordItf, SL_RECORDSTATE_RECORDING);
     (void) lresult;
+    env->ReleaseStringUTFChars(path, filePath);
+}
 
+
+extern "C"
+JNIEXPORT jboolean stopRecording(JNIEnv *env, jobject instance) {
+    SLresult lresult;
+    lresult = (*slRecordItf)->SetRecordState(slRecordItf, SL_RECORDSTATE_STOPPED);
+    (void) lresult;
+    pthread_mutex_unlock(&audioEngineLock);
+    return JNI_TRUE;
 }
 
 
@@ -378,40 +355,37 @@ extern "C"
 JNIEXPORT void shutdown(JNIEnv *env, jobject instance) {
     if (bpPlayerObject != nullptr) {
         (*bpPlayerObject)->Destroy(bpPlayerObject);
+        slVolumeItf = NULL;
+        slEffectSendItf = NULL;
+        pPlayer = NULL;
+        slbpPlayerBufferQueue = NULL;
     }
     if (slengineObject != nullptr) {
         (*slengineObject)->Destroy(slengineObject);
+        slEngineItf = NULL;
     }
     if (outputMixItf != nullptr) {
         (*outputMixItf)->Destroy(outputMixItf);
+        slEnvironmentalReverbItf = NULL;
     }
 
     if (slRecorderObject != nullptr) {
         (*slRecorderObject)->Destroy(slRecorderObject);
+        slRecordItf = NULL;
+        slbpRecorderBufferQueue = NULL;
     }
 
     env->UnregisterNatives(global_env->FindClass(classpath));
 
     free(global_vm);
+    delete audioContext;
     free(global_env);
-
-    free(resampleBuf);
-    free(nextBuffer);
+    free(buffer);
     pthread_mutex_destroy(&audioEngineLock);
 }
 
 
-extern "C"
-JNIEXPORT void stopRecording(JNIEnv *env, jobject instance) {
-    SLresult  lresult;
-    if(pthread_mutex_trylock(&audioEngineLock)){
-        LOGE("LOCK ERROR");
-        return;
-    }
-    lresult = (*slRecordItf)->SetRecordState(slRecordItf,SL_RECORDSTATE_STOPPED);
-    (void)lresult;
-    pthread_mutex_unlock(&audioEngineLock);
-}
+
 
 extern "C"
 JNIEXPORT void stopPlaying(JNIEnv *env, jobject instance) {
@@ -419,51 +393,51 @@ JNIEXPORT void stopPlaying(JNIEnv *env, jobject instance) {
 }
 
 extern "C"
-JNIEXPORT jboolean selectClip(JNIEnv *env, jobject instance, jint which, jint count) {
+JNIEXPORT jboolean releaseFile(JNIEnv *env, jobject instance) {
+    SLresult lresult;
+    pthread_mutex_unlock(&audioEngineLock);
+    if (buffer != nullptr) {
+        free(buffer);
+    }
+    lresult = (*slbpRecorderBufferQueue)->Clear(slbpRecorderBufferQueue);
+    (void) lresult;
 
-    if (pthread_mutex_trylock(&audioEngineLock)) {
+    lresult = (*slbpPlayerBufferQueue)->Clear(slbpPlayerBufferQueue);
+    (void) lresult;
+    if (SL_RESULT_SUCCESS != lresult) {
         return JNI_FALSE;
     }
 
-    switch (which) {
-        case 4:     // CLIP_PLAYBACK
-            nextBuffer = createResampledBuf(4, SL_SAMPLINGRATE_16, &nextSize);
-            // we recorded at 16 kHz, but are playing buffers at 8 Khz, so do a primitive down-sample
-            if (!nextBuffer) {
-                unsigned i;
-                for (i = 0; i < recorderSize; i += 2 * sizeof(short)) {
-                    recorderBuffer[i >> 2] = recorderBuffer[i >> 1];
-                }
-                recorderSize >>= 1;
-                nextBuffer = recorderBuffer;
-                nextSize = recorderSize;
-            }
-            break;
-    }
+    delete audioContext;
+    return JNI_TRUE;
+}
 
-    nextCount = count;
-    if (nextSize > 0) {
-        SLresult result;
-        result = (*slbpPlayerBufferQueue)->Enqueue(slbpPlayerBufferQueue, nextBuffer, nextSize);
-        if (SL_RESULT_SUCCESS != result) {
-            pthread_mutex_unlock(&audioEngineLock);
-            return JNI_FALSE;
-        }
-    } else {
+
+extern "C"
+JNIEXPORT jboolean selectClip(JNIEnv *env, jobject instance, jint which, jint count) {
+    if (pthread_mutex_trylock(&audioEngineLock)) {
+        return JNI_FALSE;
+    }
+    SLresult result;
+    result = (*slbpPlayerBufferQueue)->Enqueue(slbpPlayerBufferQueue, buffer, bqPlayerBufSize);
+    if (SL_RESULT_SUCCESS != result) {
         pthread_mutex_unlock(&audioEngineLock);
+        return JNI_FALSE;
     }
     return JNI_TRUE;
 }
 
-static JNINativeMethod methods[] = {{"createEngine",                 "()V",   (void *) createEngine},
-                                    {"createBufferQueueAudioPlayer", "(II)V", (void *) createBufferQueueAudioPlayer},
-                                    {"enableReverb",                 "(Z)Z",  (void *) enableReverb},
-                                    {"createAudioRecorder",          "(Z)Z",  (void *) createAudioRecorder},
-                                    {"startRecording",               "()V",   (void *) startRecording},
-                                    {"shutdown",                     "()V",   (void *) shutdown},
-                                    {"selectClip",                   "(II)Z", (void *) selectClip},
-                                    {"stopRecording",                "()V",   (void *) stopRecording},
-                                    {"stopPlaying",                  "()V",   (void *) stopPlaying}};
+static JNINativeMethod methods[] = {
+//        {"createEngine",                 "()V",   (void *) createEngine},
+        {"createBufferQueueAudioPlayer", "(Ljava/lang/String;II)V", (void *) createBufferQueueAudioPlayer},
+        {"enableReverb",                 "(Z)Z",                    (void *) enableReverb},
+        {"createAudioRecorder",          "()Z",                     (void *) createAudioRecorder},
+        {"startRecording",               "(Ljava/lang/String;)V",   (void *) startRecording},
+        {"shutdown",                     "()V",                     (void *) shutdown},
+        {"selectClip",                   "(II)Z",                   (void *) selectClip},
+        {"stopRecording",                "()Z",                     (void *) stopRecording},
+        {"stopPlaying",                  "()V",                     (void *) stopPlaying},
+        {"releaseFile",                  "()Z",                     (void *) releaseFile}};
 
 
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
@@ -475,6 +449,10 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
                                     sizeof(methods) / sizeof(JNINativeMethod)) < 0) {
         LOGE("REGIST METHOD ERROR");
     }
+
+    createEngine();
+    CreateOutputMix();
+
     return JNI_VERSION_1_6;
 
 }

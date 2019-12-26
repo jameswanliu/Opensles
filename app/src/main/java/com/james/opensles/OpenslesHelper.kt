@@ -11,9 +11,7 @@ class OpenslesHelper {
         }
     }
 
-    external fun createEngine()
-
-    external fun createBufferQueueAudioPlayer(sampleRate: Int, samplesPerBuf: Int)
+    external fun createBufferQueueAudioPlayer(path:String,sampleRate: Int, samplesPerBuf: Int)
     external fun createAssetAudioPlayer(
         assetManager: AssetManager?,
         filename: String?
@@ -35,9 +33,10 @@ class OpenslesHelper {
     external fun selectClip(which: Int, count: Int): Boolean
     external fun enableReverb(enabled: Boolean): Boolean
     external fun createAudioRecorder(): Boolean
-    external fun startRecording()
+    external fun startRecording(path: String)
     external fun shutdown()
-    external fun stopRecording()
+    external fun stopRecording():Boolean
+    external fun releaseFile():Boolean
     external fun stopPlaying()
 
 }
