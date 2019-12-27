@@ -480,7 +480,7 @@ createAssetAudioPlayer(JNIEnv *env, jobject instance, jobject assetManager, jstr
         if (slEngineItf != nullptr) {
             lresult = (*slEngineItf)->CreateAudioPlayer(slEngineItf, &fdPlayObjectItf,
                                                         &slDataSource, &slDataSink,
-                                                        3, ids, req);
+                                                        sizeof(ids)/ sizeof(ids[0]), ids, req);
             (void) lresult;
 
 
