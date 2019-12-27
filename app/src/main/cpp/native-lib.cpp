@@ -4,6 +4,9 @@
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 #include <pthread.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
+#include <omp.h>
 
 
 
@@ -38,25 +41,38 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,TAG,__VA_ARGS__)
 #define CHANEL 2
+#define PERIOD 20
 static const char *classpath = "com/james/opensles/OpenslesHelper";
 
 JavaVM *global_vm;
 JNIEnv *global_env;
+
 SLObjectItf slRecorderObject;
 SLRecordItf slRecordItf;
+
 SLEngineItf slEngineItf;
 SLObjectItf slengineObject;
+
 SLObjectItf outputMixItf;
 SLEnvironmentalReverbItf slEnvironmentalReverbItf = nullptr;
 SLAndroidSimpleBufferQueueItf slbpPlayerBufferQueue;
 SLAndroidSimpleBufferQueueItf slbpRecorderBufferQueue;
+
 SLEnvironmentalReverbSettings slEnvironmentalReverbSettings;
 SLObjectItf bpPlayerObject;
 SLVolumeItf slVolumeItf;
 SLEffectSendItf slEffectSendItf;
 SLPlayItf pPlayer;
-static int bqPlayerSampleRate = 44100;
-static size_t bqPlayerBufSize = static_cast<size_t >( CHANEL * bqPlayerSampleRate * 2);
+//static int bqPlayerSampleRate = 44100;
+static SLmilliHertz bqPlayerSampleRate = 0;
+static size_t bqPlayerBufSize = 0;
+
+SLObjectItf fdPlayObjectItf;
+SLPlayItf fdPayItf;
+SLMuteSoloItf fdMuteSoloItf;
+SLVolumeItf fdVolumeItf;
+SLSeekItf slSeekItf;
+
 
 unsigned char *buffer; //缓冲区
 
@@ -93,6 +109,7 @@ public:
 
 
     ~AudioContext() {
+        fclose(file);
         free(file);
         free(buffer);
         bufferSize = 0;
@@ -102,7 +119,7 @@ public:
 
 AudioContext *audioContext;
 
-void createEngine() {
+int createEngine() {
     SLresult lresult;
 
     SLEngineOption options[] = {{(SLuint32) SL_ENGINEOPTION_THREADSAFE, (SLuint32) SL_BOOLEAN_TRUE}};
@@ -113,9 +130,10 @@ void createEngine() {
     lresult = (*slengineObject)->GetInterface(slengineObject, SL_IID_ENGINE, &slEngineItf);
     (void) lresult;
 
+    return 1;
 }
 
-void CreateOutputMix() {
+int CreateOutputMix() {
 
     SLresult lresult;
     SLInterfaceID slInterfaceId[1] = {SL_IID_ENVIRONMENTALREVERB};
@@ -135,6 +153,8 @@ void CreateOutputMix() {
                 slEnvironmentalReverbItf, &slEnvironmentalReverbSettings);
         (void) lresult;
     }
+
+    return 1;
 }
 
 
@@ -144,6 +164,7 @@ void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
 
     if (audioContext != nullptr) {
         if (audioContext->buffer != nullptr && audioContext->bufferSize > 0) {
+            fread(audioContext->buffer, audioContext->bufferSize, 1, audioContext->file);
             SLresult result;
             // enqueue another buffer
             result = (*slbpPlayerBufferQueue)->Enqueue(slbpPlayerBufferQueue, audioContext->buffer,
@@ -155,21 +176,36 @@ void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
             }
             (void) result;
         } else {
+            delete audioContext;
             pthread_mutex_unlock(&audioEngineLock);
             LOGE("buffer IS NULL");
         }
 
     } else {
+        delete audioContext;
         pthread_mutex_unlock(&audioEngineLock);
         LOGE("AUDIOCONTEXT IS NULL");
     }
 }
 
-extern "C"
+extern "C" {
 JNIEXPORT void
 createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jstring path, jint sampleRate,
                              jint samplesPerBuf) {
     SLresult lresult;
+
+
+    if (sampleRate >= 0 && samplesPerBuf >= 0) {
+        bqPlayerSampleRate = sampleRate * 1000;
+        /*
+         * device native buffer size is another factor to minimize audio latency, not used in this
+         * sample: we only play one giant buffer here
+         */
+//        bqPlayerBufSize = samplesPerBuf;
+        bqPlayerBufSize = CHANEL * bqPlayerSampleRate * PERIOD * 8;
+    }
+
+
     const char *filePath = env->GetStringUTFChars(path, JNI_FALSE);
     FILE *file = fopen(filePath, "r");
 
@@ -197,7 +233,9 @@ createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jstring path, jint s
      */
     SLDataSource dataSource = {&inputlocator, &dataFormat};
 
-
+    if (bqPlayerSampleRate) {
+        dataFormat.samplesPerSec = bqPlayerSampleRate;
+    }
     /**
      * 定义音频输出
      */
@@ -248,24 +286,31 @@ createBufferQueueAudioPlayer(JNIEnv *env, jobject instance, jstring path, jint s
 }
 
 
-
-
-
-extern "C"
 JNIEXPORT jboolean enableReverb(JNIEnv *env, jobject instance, jboolean boolean) {
     return JNI_TRUE;
 }
 
 
 void bqRecorderCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
-    SLresult result;
-    result = (*slRecordItf)->SetRecordState(slRecordItf, SL_RECORDSTATE_STOPPED);
-    (void) result;
+    AudioContext *audioContexts = reinterpret_cast<AudioContext *>(context);
+    if (audioContexts->buffer != nullptr) {
+        fwrite(audioContexts->buffer, audioContexts->bufferSize, 1, audioContexts->file);
+        SLresult result;
+        SLuint32 state;
+        result = (*slRecordItf)->GetRecordState(slRecordItf, &state);
+        (void) result;
+        if (state == SL_RECORDSTATE_RECORDING) {
+            result = (*slbpRecorderBufferQueue)->Enqueue(slbpRecorderBufferQueue,
+                                                         audioContexts->buffer,
+                                                         audioContexts->bufferSize);
+            (void) result;
+        }
+    }
+
     pthread_mutex_unlock(&audioEngineLock);
 }
 
 
-extern "C"
 JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance) {
     SLresult lresult;
 
@@ -300,16 +345,12 @@ JNIEXPORT jboolean createAudioRecorder(JNIEnv *env, jobject instance) {
     (void) lresult;
 
     lresult = (*slbpRecorderBufferQueue)->RegisterCallback(slbpRecorderBufferQueue,
-                                                           bqRecorderCallback, nullptr);
+                                                           bqRecorderCallback, audioContext);
     (void) lresult;
     return JNI_TRUE;
 }
 
 
-
-
-
-extern "C"
 JNIEXPORT void startRecording(JNIEnv *env, jobject instance, jstring path) {
     SLresult lresult;
     if (pthread_mutex_trylock(&audioEngineLock)) {
@@ -343,7 +384,6 @@ JNIEXPORT void startRecording(JNIEnv *env, jobject instance, jstring path) {
 }
 
 
-extern "C"
 JNIEXPORT jboolean stopRecording(JNIEnv *env, jobject instance) {
     SLresult lresult;
     lresult = (*slRecordItf)->SetRecordState(slRecordItf, SL_RECORDSTATE_STOPPED);
@@ -353,7 +393,6 @@ JNIEXPORT jboolean stopRecording(JNIEnv *env, jobject instance) {
 }
 
 
-extern "C"
 JNIEXPORT void shutdown(JNIEnv *env, jobject instance) {
     if (bpPlayerObject != nullptr) {
         (*bpPlayerObject)->Destroy(bpPlayerObject);
@@ -377,6 +416,15 @@ JNIEXPORT void shutdown(JNIEnv *env, jobject instance) {
         slbpRecorderBufferQueue = NULL;
     }
 
+    if (fdPlayObjectItf != nullptr) {
+        (*fdPlayObjectItf)->Destroy(fdPlayObjectItf);
+        fdVolumeItf = NULL;
+        fdMuteSoloItf = NULL;
+        fdPayItf = NULL;
+        slSeekItf = NULL;
+    }
+
+
     env->UnregisterNatives(global_env->FindClass(classpath));
 
     free(global_vm);
@@ -387,14 +435,89 @@ JNIEXPORT void shutdown(JNIEnv *env, jobject instance) {
 }
 
 
-
-
-extern "C"
 JNIEXPORT void stopPlaying(JNIEnv *env, jobject instance) {
+    SLresult lresult;
+    if (pPlayer != nullptr) {
+        lresult = (*pPlayer)->SetPlayState(pPlayer, SL_PLAYSTATE_PAUSED);
+        (void) lresult;
+    }
+    pthread_mutex_unlock(&audioEngineLock);
 
 }
 
-extern "C"
+JNIEXPORT void setPlayingAssetAudioPlayer(JNIEnv *env, jobject instance, jboolean flag) {
+    SLresult lresult;
+    if (fdPayItf != nullptr) {
+        lresult = (*fdPayItf)->SetPlayState(fdPayItf,
+                                            flag ? SL_PLAYSTATE_PLAYING : SL_PLAYSTATE_PAUSED);
+        (void) lresult;
+    }
+}
+
+
+JNIEXPORT jboolean
+createAssetAudioPlayer(JNIEnv *env, jobject instance, jobject assetManager, jstring fileName) {
+
+    SLresult lresult;
+    const char *file = env->GetStringUTFChars(fileName, JNI_FALSE);
+    AAssetManager *assetmanager = AAssetManager_fromJava(env, assetManager);
+    AAsset *asset = AAssetManager_open(assetmanager, file, AASSET_MODE_UNKNOWN);
+
+    if (asset != nullptr) {
+        off_t start, lenght;
+        int fd = AAsset_openFileDescriptor(asset, &start, &lenght);
+        SLDataLocator_AndroidFD androidFd = {SL_DATALOCATOR_ANDROIDFD, fd, start, lenght};
+        SLDataFormat_MIME fd_mime = {SL_DATAFORMAT_MIME, NULL, SL_CONTAINERTYPE_UNSPECIFIED};
+        SLDataSource slDataSource = {&androidFd, &fd_mime};
+
+
+        SLDataLocator_OutputMix fdoutput = {SL_DATALOCATOR_OUTPUTMIX, outputMixItf};
+        SLDataSink slDataSink = {&fdoutput, NULL};
+
+
+        const SLInterfaceID ids[3] = {SL_IID_SEEK, SL_IID_MUTESOLO, SL_IID_VOLUME};
+        const SLboolean req[3] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE};
+        if (slEngineItf != nullptr) {
+            lresult = (*slEngineItf)->CreateAudioPlayer(slEngineItf, &fdPlayObjectItf,
+                                                        &slDataSource, &slDataSink,
+                                                        3, ids, req);
+            (void) lresult;
+
+
+            lresult = (*fdPlayObjectItf)->Realize(fdPlayObjectItf, JNI_FALSE);
+            (void) lresult;
+
+            lresult = (*fdPlayObjectItf)->GetInterface(fdPlayObjectItf, SL_IID_PLAY, &fdPayItf);
+            (void) lresult;
+            lresult = (*fdPlayObjectItf)->GetInterface(fdPlayObjectItf, SL_IID_MUTESOLO,
+                                                       &fdMuteSoloItf);
+
+            (void) lresult;
+            lresult = (*fdPlayObjectItf)->GetInterface(fdPlayObjectItf, SL_IID_SEEK,
+                                                       &slSeekItf);
+            (void) lresult;
+            lresult = (*fdPlayObjectItf)->GetInterface(fdPlayObjectItf, SL_IID_VOLUME,
+                                                       &fdVolumeItf);
+            (void) lresult;
+
+
+            lresult = (*slSeekItf)->SetLoop(slSeekItf, JNI_TRUE, 0, SL_TIME_UNKNOWN);
+            (void) lresult;
+        } else {
+            LOGE("SLENGINE IS NULL");
+            return JNI_FALSE;
+        }
+
+
+    } else {
+        LOGE("GET ASSET ERROR");
+        return JNI_FALSE;
+    }
+    env->ReleaseStringUTFChars(fileName, file);
+    return JNI_TRUE;
+}
+
+
 JNIEXPORT jboolean releaseFile(JNIEnv *env, jobject instance) {
     SLresult lresult;
     pthread_mutex_unlock(&audioEngineLock);
@@ -412,7 +535,6 @@ JNIEXPORT jboolean releaseFile(JNIEnv *env, jobject instance) {
 }
 
 
-extern "C"
 JNIEXPORT jboolean selectClip(JNIEnv *env, jobject instance, jint which, jint count) {
     if (pthread_mutex_trylock(&audioEngineLock)) {
         return JNI_FALSE;
@@ -425,18 +547,21 @@ JNIEXPORT jboolean selectClip(JNIEnv *env, jobject instance, jint which, jint co
     }
     return JNI_TRUE;
 }
+}
 
 static JNINativeMethod methods[] = {
 //        {"createEngine",                 "()V",   (void *) createEngine},
-        {"createBufferQueueAudioPlayer", "(Ljava/lang/String;II)V", (void *) createBufferQueueAudioPlayer},
-        {"enableReverb",                 "(Z)Z",                    (void *) enableReverb},
-        {"createAudioRecorder",          "()Z",                     (void *) createAudioRecorder},
-        {"startRecording",               "(Ljava/lang/String;)V",   (void *) startRecording},
-        {"shutdown",                     "()V",                     (void *) shutdown},
-        {"selectClip",                   "(II)Z",                   (void *) selectClip},
-        {"stopRecording",                "()Z",                     (void *) stopRecording},
-        {"stopPlaying",                  "()V",                     (void *) stopPlaying},
-        {"releaseFile",                  "()Z",                     (void *) releaseFile}};
+        {"createBufferQueueAudioPlayer", "(Ljava/lang/String;II)V",                                 (void *) createBufferQueueAudioPlayer},
+        {"enableReverb",                 "(Z)Z",                                                    (void *) enableReverb},
+        {"createAssetAudioPlayer",       "(Landroid/content/res/AssetManager;Ljava/lang/String;)Z", (void *) createAssetAudioPlayer},
+        {"setPlayingAssetAudioPlayer",   "(Z)V",                                                    (void *) setPlayingAssetAudioPlayer},
+        {"createAudioRecorder",          "()Z",                                                     (void *) createAudioRecorder},
+        {"startRecording",               "(Ljava/lang/String;)V",                                   (void *) startRecording},
+        {"shutdown",                     "()V",                                                     (void *) shutdown},
+        {"selectClip",                   "(II)Z",                                                   (void *) selectClip},
+        {"stopRecording",                "()Z",                                                     (void *) stopRecording},
+        {"stopPlaying",                  "()V",                                                     (void *) stopPlaying},
+        {"releaseFile",                  "()Z",                                                     (void *) releaseFile}};
 
 
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {

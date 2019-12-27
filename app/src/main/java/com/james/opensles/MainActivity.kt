@@ -30,9 +30,7 @@ class MainActivity : AppCompatActivity() {
     private var isRecord = false
     private var openslesHelper: OpenslesHelper? = null
 
-    companion object {
-        var created = false
-    }
+    var created = false
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -206,10 +204,8 @@ class MainActivity : AppCompatActivity() {
 
 
     override fun onDestroy() {
-        openslesHelper?.shutdown()
-        openslesHelper = null
+        openslesHelper?.releaseFile()
         super.onDestroy()
     }
-
 
 }

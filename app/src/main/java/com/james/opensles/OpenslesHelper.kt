@@ -5,16 +5,16 @@ import android.content.res.AssetManager
 
 class OpenslesHelper {
 
-    companion object{
+    companion object {
         init {
             System.loadLibrary("native-lib")
         }
     }
 
-    external fun createBufferQueueAudioPlayer(path:String,sampleRate: Int, samplesPerBuf: Int)
+    external fun createBufferQueueAudioPlayer(path: String, sampleRate: Int, samplesPerBuf: Int)
     external fun createAssetAudioPlayer(
-        assetManager: AssetManager?,
-        filename: String?
+        assetManager: AssetManager,
+        filename: String
     ): Boolean
 
     // true == PLAYING, false == PAUSED
@@ -35,17 +35,10 @@ class OpenslesHelper {
     external fun createAudioRecorder(): Boolean
     external fun startRecording(path: String)
     external fun shutdown()
-    external fun stopRecording():Boolean
-    external fun releaseFile():Boolean
+    external fun stopRecording(): Boolean
+    external fun releaseFile(): Boolean
     external fun stopPlaying()
 
 }
 
 
-object Constants{
-    const val STATE_NORMAL = 0
-    const val STATE_RECORD = 1
-    const val STATE_COMPLETE = 2
-    const val STATE_PLAYING = 3
-    const val STATE_PAUSE = 4
-}
